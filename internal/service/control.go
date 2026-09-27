@@ -20,17 +20,18 @@ import (
 )
 
 type ControlState struct {
-	Network    *route.Network
-	Stations   map[string]model.Station
-	Routes     map[string]model.RouteState
-	Valves     map[string]model.ValveState
-	Closures   map[string]model.ClosureState
-	Pressures  map[string]model.PressureState
-	Tracking   map[string][]model.TrackingState
-	Permits    map[string][]model.PermitState
-	Incidents  []model.Incident
-	Revision   string
-	Persistent *journal.FileStore
+	Network     *route.Network
+	Stations    map[string]model.Station
+	Routes      map[string]model.RouteState
+	Valves      map[string]model.ValveState
+	Closures    map[string]model.ClosureState
+	Pressures   map[string]model.PressureState
+	Tracking    map[string][]model.TrackingState
+	Permits     map[string][]model.PermitState
+	Maintenance map[string]model.MaintenancePermit
+	Incidents   []model.Incident
+	Revision    string
+	Persistent  *journal.FileStore
 }
 
 type LaunchRequest struct {
@@ -64,16 +65,17 @@ func defaultControlState() *ControlState {
 	network := route.DefaultNetwork()
 	stations := network.Stations()
 	state := &ControlState{
-		Network:   network,
-		Stations:  make(map[string]model.Station),
-		Routes:    make(map[string]model.RouteState),
-		Valves:    make(map[string]model.ValveState),
-		Closures:  make(map[string]model.ClosureState),
-		Pressures: make(map[string]model.PressureState),
-		Tracking:  make(map[string][]model.TrackingState),
-		Permits:   make(map[string][]model.PermitState),
-		Incidents: make([]model.Incident, 0),
-		Revision:  model.NewRevision(),
+		Network:     network,
+		Stations:    make(map[string]model.Station),
+		Routes:      make(map[string]model.RouteState),
+		Valves:      make(map[string]model.ValveState),
+		Closures:    make(map[string]model.ClosureState),
+		Pressures:   make(map[string]model.PressureState),
+		Tracking:    make(map[string][]model.TrackingState),
+		Permits:     make(map[string][]model.PermitState),
+		Maintenance: make(map[string]model.MaintenancePermit),
+		Incidents:   make([]model.Incident, 0),
+		Revision:    model.NewRevision(),
 	}
 	for _, station := range stations {
 		state.Stations[station.ID] = station
@@ -188,6 +190,9 @@ func (r *Runtime) ValidateLaunchRequest(request LaunchRequest) error {
 	}
 	if request.TargetPressure <= 0 || request.TargetPressure > station.PressureLimit {
 		return fmt.Errorf("target pressure must be within 0 and %.2f", station.PressureLimit)
+	}
+	if permit, held := r.maintenanceHold(request.StationID, request.RouteID); held {
+		return fmt.Errorf("maintenance permit %s (%s) holds station %s and routes %s: launch not permitted", permit.ID, permit.Status, permit.StationID, strings.Join(permit.RouteIDs, ","))
 	}
 	return nil
 }
@@ -500,17 +505,18 @@ func (r *Runtime) Snapshot() model.ControlSnapshot {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	snapshot := model.ControlSnapshot{
-		Revision:   control.Revision,
-		CapturedAt: time.Now().UTC(),
-		Stations:   make([]model.Station, 0, len(control.Stations)),
-		Valves:     make([]model.ValveState, 0, len(control.Valves)),
-		Closures:   make([]model.ClosureState, 0, len(control.Closures)),
-		Pressures:  make([]model.PressureState, 0, len(control.Pressures)),
-		Routes:     make([]model.RouteState, 0, len(control.Routes)),
-		Tracking:   make([]model.TrackingState, 0),
-		Permits:    make([]model.PermitState, 0),
-		Runs:       r.Runs.Snapshot(),
-		Incidents:  append([]model.Incident(nil), control.Incidents...),
+		Revision:    control.Revision,
+		CapturedAt:  time.Now().UTC(),
+		Stations:    make([]model.Station, 0, len(control.Stations)),
+		Valves:      make([]model.ValveState, 0, len(control.Valves)),
+		Closures:    make([]model.ClosureState, 0, len(control.Closures)),
+		Pressures:   make([]model.PressureState, 0, len(control.Pressures)),
+		Routes:      make([]model.RouteState, 0, len(control.Routes)),
+		Tracking:    make([]model.TrackingState, 0),
+		Permits:     make([]model.PermitState, 0),
+		Maintenance: make([]model.MaintenancePermit, 0, len(control.Maintenance)),
+		Runs:        r.Runs.Snapshot(),
+		Incidents:   append([]model.Incident(nil), control.Incidents...),
 	}
 	for _, value := range control.Stations {
 		snapshot.Stations = append(snapshot.Stations, value)
@@ -534,6 +540,10 @@ func (r *Runtime) Snapshot() model.ControlSnapshot {
 	for _, values := range control.Permits {
 		snapshot.Permits = append(snapshot.Permits, values...)
 	}
+	for _, value := range control.Maintenance {
+		snapshot.Maintenance = append(snapshot.Maintenance, value)
+	}
+	snapshot.Maintenance = model.SortedMaintenance(snapshot.Maintenance)
 	sort.Slice(snapshot.Valves, func(i, j int) bool { return snapshot.Valves[i].ID < snapshot.Valves[j].ID })
 	sort.Slice(snapshot.Routes, func(i, j int) bool { return snapshot.Routes[i].ID < snapshot.Routes[j].ID })
 	sort.Slice(snapshot.Tracking, func(i, j int) bool { return snapshot.Tracking[i].ObservedAt.Before(snapshot.Tracking[j].ObservedAt) })
@@ -598,6 +608,7 @@ func (r *Runtime) RecoverPersistent() (RecoveryReport, error) {
 	r.control.Pressures = make(map[string]model.PressureState)
 	r.control.Tracking = make(map[string][]model.TrackingState)
 	r.control.Permits = make(map[string][]model.PermitState)
+	r.control.Maintenance = make(map[string]model.MaintenancePermit)
 	for _, value := range snapshot.Control.Routes {
 		r.control.Routes[value.ID] = value
 	}
@@ -615,6 +626,9 @@ func (r *Runtime) RecoverPersistent() (RecoveryReport, error) {
 	}
 	for _, value := range snapshot.Control.Permits {
 		r.control.Permits[value.RunID] = append(r.control.Permits[value.RunID], value)
+	}
+	for _, value := range snapshot.Control.Maintenance {
+		r.control.Maintenance[value.ID] = value
 	}
 	r.control.Incidents = append([]model.Incident(nil), snapshot.Control.Incidents...)
 	r.control.Revision = model.NewRevision()
@@ -655,6 +669,22 @@ func (r *Runtime) InterlockStatus() []model.Interlock {
 			reason = fmt.Sprintf("locked for %s at epoch %d", closure.RunID, closure.CommandEpoch)
 		}
 		interlocks = append(interlocks, model.Interlock{Name: "closure/" + closure.StationID, Ready: closure.Locked, Reason: reason})
+	}
+	for _, permit := range snapshot.Maintenance {
+		if !permit.Active() {
+			interlocks = append(interlocks, model.Interlock{Name: "maintenance/" + permit.ID, Ready: true, Reason: fmt.Sprintf("permit %s, operations restored", permit.Status)})
+			continue
+		}
+		blocks := permit.BlockedOperations()
+		held := make([]string, 0, len(blocks))
+		for _, block := range blocks {
+			held = append(held, block.Operation+" on "+block.Target)
+		}
+		interlocks = append(interlocks, model.Interlock{
+			Name:   "maintenance/" + permit.ID,
+			Ready:  false,
+			Reason: fmt.Sprintf("permit %s for %q: not permitted: %s", permit.Status, permit.WorkRef, strings.Join(held, "; ")),
+		})
 	}
 	sort.Slice(interlocks, func(i, j int) bool { return interlocks[i].Name < interlocks[j].Name })
 	return interlocks
@@ -705,11 +735,18 @@ func (r *Runtime) HealthDetails() map[string]any {
 	}
 	ready := validationError == nil && run.Health(r.Runs) && tracker.Ready(r.Tracker) && launcher.Ready(r.Launcher)
 	recoverySteps := NewRecoveryPlan().Steps()
+	activeMaintenance := 0
+	for _, permit := range snapshot.Maintenance {
+		if permit.Active() {
+			activeMaintenance++
+		}
+	}
 	return map[string]any{
 		"status":              map[bool]string{true: "ok", false: "degraded"}[ready],
 		"ready":               ready,
 		"revision":            snapshot.Revision,
 		"active_runs":         len(run.Active(r.Runs)),
+		"active_maintenance":  activeMaintenance,
 		"journal_events":      len(r.Journal.Events()),
 		"persistent_sequence": sequence,
 		"persistent_checksum": checksum,

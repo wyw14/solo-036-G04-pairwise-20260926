@@ -108,17 +108,18 @@ type OperationRecord struct {
 }
 
 type ControlSnapshot struct {
-	Revision   string          `json:"revision"`
-	CapturedAt time.Time       `json:"captured_at"`
-	Stations   []Station       `json:"stations"`
-	Valves     []ValveState    `json:"valves"`
-	Closures   []ClosureState  `json:"closures"`
-	Pressures  []PressureState `json:"pressures"`
-	Routes     []RouteState    `json:"routes"`
-	Tracking   []TrackingState `json:"tracking"`
-	Permits    []PermitState   `json:"permits"`
-	Runs       []Run           `json:"runs"`
-	Incidents  []Incident      `json:"incidents"`
+	Revision    string              `json:"revision"`
+	CapturedAt  time.Time           `json:"captured_at"`
+	Stations    []Station           `json:"stations"`
+	Valves      []ValveState        `json:"valves"`
+	Closures    []ClosureState      `json:"closures"`
+	Pressures   []PressureState     `json:"pressures"`
+	Routes      []RouteState        `json:"routes"`
+	Tracking    []TrackingState     `json:"tracking"`
+	Permits     []PermitState       `json:"permits"`
+	Maintenance []MaintenancePermit `json:"maintenance"`
+	Runs        []Run               `json:"runs"`
+	Incidents   []Incident          `json:"incidents"`
 }
 
 func (s Station) Validate() error {
@@ -266,6 +267,15 @@ func (s ControlSnapshot) Validate() error {
 	for _, permit := range s.Permits {
 		if err := permit.Validate(); err != nil {
 			return fmt.Errorf("permit %s: %w", permit.Name, err)
+		}
+	}
+	routes := make(map[string]RouteState, len(s.Routes))
+	for _, route := range s.Routes {
+		routes[route.ID] = route
+	}
+	for _, permit := range s.Maintenance {
+		if err := permit.Validate(stations, routes); err != nil {
+			return fmt.Errorf("maintenance permit %s: %w", permit.ID, err)
 		}
 	}
 	return nil

@@ -11,6 +11,7 @@ import (
 	"github.com/wyw14/solo-036/internal/emergency"
 	"github.com/wyw14/solo-036/internal/journal"
 	"github.com/wyw14/solo-036/internal/launcher"
+	"github.com/wyw14/solo-036/internal/maintenance"
 	"github.com/wyw14/solo-036/internal/model"
 	"github.com/wyw14/solo-036/internal/permit"
 	"github.com/wyw14/solo-036/internal/receiver"
@@ -20,17 +21,18 @@ import (
 )
 
 type ControlState struct {
-	Network    *route.Network
-	Stations   map[string]model.Station
-	Routes     map[string]model.RouteState
-	Valves     map[string]model.ValveState
-	Closures   map[string]model.ClosureState
-	Pressures  map[string]model.PressureState
-	Tracking   map[string][]model.TrackingState
-	Permits    map[string][]model.PermitState
-	Incidents  []model.Incident
-	Revision   string
-	Persistent *journal.FileStore
+	Network            *route.Network
+	Stations           map[string]model.Station
+	Routes             map[string]model.RouteState
+	Valves             map[string]model.ValveState
+	Closures           map[string]model.ClosureState
+	Pressures          map[string]model.PressureState
+	Tracking           map[string][]model.TrackingState
+	Permits            map[string][]model.PermitState
+	MaintenancePermits map[string]model.MaintenancePermit
+	Incidents          []model.Incident
+	Revision           string
+	Persistent         *journal.FileStore
 }
 
 type LaunchRequest struct {
@@ -53,27 +55,29 @@ type ReceiveRequest struct {
 }
 
 type RecoveryReport struct {
-	RecoveredRuns    int  `json:"recovered_runs"`
-	RecoveredRoutes  int  `json:"recovered_routes"`
-	RecoveredPermits int  `json:"recovered_permits"`
-	JournalEvents    int  `json:"journal_events"`
-	Ready            bool `json:"ready"`
+	RecoveredRuns               int  `json:"recovered_runs"`
+	RecoveredRoutes             int  `json:"recovered_routes"`
+	RecoveredPermits            int  `json:"recovered_permits"`
+	RecoveredMaintenancePermits int  `json:"recovered_maintenance_permits"`
+	JournalEvents               int  `json:"journal_events"`
+	Ready                       bool `json:"ready"`
 }
 
 func defaultControlState() *ControlState {
 	network := route.DefaultNetwork()
 	stations := network.Stations()
 	state := &ControlState{
-		Network:   network,
-		Stations:  make(map[string]model.Station),
-		Routes:    make(map[string]model.RouteState),
-		Valves:    make(map[string]model.ValveState),
-		Closures:  make(map[string]model.ClosureState),
-		Pressures: make(map[string]model.PressureState),
-		Tracking:  make(map[string][]model.TrackingState),
-		Permits:   make(map[string][]model.PermitState),
-		Incidents: make([]model.Incident, 0),
-		Revision:  model.NewRevision(),
+		Network:            network,
+		Stations:           make(map[string]model.Station),
+		Routes:             make(map[string]model.RouteState),
+		Valves:             make(map[string]model.ValveState),
+		Closures:           make(map[string]model.ClosureState),
+		Pressures:          make(map[string]model.PressureState),
+		Tracking:           make(map[string][]model.TrackingState),
+		Permits:            make(map[string][]model.PermitState),
+		MaintenancePermits: make(map[string]model.MaintenancePermit),
+		Incidents:          make([]model.Incident, 0),
+		Revision:           model.NewRevision(),
 	}
 	for _, station := range stations {
 		state.Stations[station.ID] = station
@@ -182,6 +186,9 @@ func (r *Runtime) ValidateLaunchRequest(request LaunchRequest) error {
 	}
 	if routeState.FromStation != station.ID {
 		return errors.New("route does not start at launcher")
+	}
+	if err := r.ensureNoMaintenanceLockout(request.StationID, request.RouteID); err != nil {
+		return err
 	}
 	if _, err := control.Network.Path(routeState.FromStation, routeState.ToStation, request.TargetPressure); err != nil {
 		return err
@@ -353,6 +360,9 @@ func (r *Runtime) GrantPassage(runID, stationID string) (model.OperationRecord, 
 	if _, ok := control.Stations[stationID]; !ok {
 		return model.OperationRecord{}, errors.New("unknown passage station")
 	}
+	if err := r.ensureNoMaintenanceLockout(stationID, ""); err != nil {
+		return model.OperationRecord{}, err
+	}
 	generation := r.Tracker.Generation(runID)
 	points := r.Lineage.Evidence(runID, stationID, generation)
 	if len(points) < 2 {
@@ -388,6 +398,9 @@ func (r *Runtime) Receive(runID string, request ReceiveRequest) (model.Operation
 	station, ok := control.Stations[request.StationID]
 	if !ok || station.Role != model.StationReceiver {
 		return model.OperationRecord{}, errors.New("receiver station is invalid")
+	}
+	if err := r.ensureNoMaintenanceLockout(request.StationID, ""); err != nil {
+		return model.OperationRecord{}, err
 	}
 	current, ok := r.Runs.Get(runID)
 	if !ok {
@@ -500,17 +513,18 @@ func (r *Runtime) Snapshot() model.ControlSnapshot {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	snapshot := model.ControlSnapshot{
-		Revision:   control.Revision,
-		CapturedAt: time.Now().UTC(),
-		Stations:   make([]model.Station, 0, len(control.Stations)),
-		Valves:     make([]model.ValveState, 0, len(control.Valves)),
-		Closures:   make([]model.ClosureState, 0, len(control.Closures)),
-		Pressures:  make([]model.PressureState, 0, len(control.Pressures)),
-		Routes:     make([]model.RouteState, 0, len(control.Routes)),
-		Tracking:   make([]model.TrackingState, 0),
-		Permits:    make([]model.PermitState, 0),
-		Runs:       r.Runs.Snapshot(),
-		Incidents:  append([]model.Incident(nil), control.Incidents...),
+		Revision:           control.Revision,
+		CapturedAt:         time.Now().UTC(),
+		Stations:           make([]model.Station, 0, len(control.Stations)),
+		Valves:             make([]model.ValveState, 0, len(control.Valves)),
+		Closures:           make([]model.ClosureState, 0, len(control.Closures)),
+		Pressures:          make([]model.PressureState, 0, len(control.Pressures)),
+		Routes:             make([]model.RouteState, 0, len(control.Routes)),
+		Tracking:           make([]model.TrackingState, 0),
+		Permits:            make([]model.PermitState, 0),
+		MaintenancePermits: make([]model.MaintenancePermit, 0, len(control.MaintenancePermits)),
+		Runs:               r.Runs.Snapshot(),
+		Incidents:          append([]model.Incident(nil), control.Incidents...),
 	}
 	for _, value := range control.Stations {
 		snapshot.Stations = append(snapshot.Stations, value)
@@ -534,9 +548,18 @@ func (r *Runtime) Snapshot() model.ControlSnapshot {
 	for _, values := range control.Permits {
 		snapshot.Permits = append(snapshot.Permits, values...)
 	}
+	for _, permit := range control.MaintenancePermits {
+		snapshot.MaintenancePermits = append(snapshot.MaintenancePermits, permit)
+	}
 	sort.Slice(snapshot.Valves, func(i, j int) bool { return snapshot.Valves[i].ID < snapshot.Valves[j].ID })
 	sort.Slice(snapshot.Routes, func(i, j int) bool { return snapshot.Routes[i].ID < snapshot.Routes[j].ID })
 	sort.Slice(snapshot.Tracking, func(i, j int) bool { return snapshot.Tracking[i].ObservedAt.Before(snapshot.Tracking[j].ObservedAt) })
+	sort.Slice(snapshot.MaintenancePermits, func(i, j int) bool {
+		if snapshot.MaintenancePermits[i].AppliedAt.Equal(snapshot.MaintenancePermits[j].AppliedAt) {
+			return snapshot.MaintenancePermits[i].ID < snapshot.MaintenancePermits[j].ID
+		}
+		return snapshot.MaintenancePermits[i].AppliedAt.Before(snapshot.MaintenancePermits[j].AppliedAt)
+	})
 	return snapshot
 }
 
@@ -598,6 +621,7 @@ func (r *Runtime) RecoverPersistent() (RecoveryReport, error) {
 	r.control.Pressures = make(map[string]model.PressureState)
 	r.control.Tracking = make(map[string][]model.TrackingState)
 	r.control.Permits = make(map[string][]model.PermitState)
+	r.control.MaintenancePermits = make(map[string]model.MaintenancePermit)
 	for _, value := range snapshot.Control.Routes {
 		r.control.Routes[value.ID] = value
 	}
@@ -616,19 +640,24 @@ func (r *Runtime) RecoverPersistent() (RecoveryReport, error) {
 	for _, value := range snapshot.Control.Permits {
 		r.control.Permits[value.RunID] = append(r.control.Permits[value.RunID], value)
 	}
+	for _, value := range snapshot.Control.MaintenancePermits {
+		r.control.MaintenancePermits[value.ID] = value
+	}
 	r.control.Incidents = append([]model.Incident(nil), snapshot.Control.Incidents...)
 	r.control.Revision = model.NewRevision()
 	r.mu.Unlock()
+	maintenance.Restore(r.Maintenance, snapshot.Control.MaintenancePermits)
 	events, err := control.Persistent.Events()
 	if err != nil {
 		return RecoveryReport{}, err
 	}
 	return RecoveryReport{
-		RecoveredRuns:    len(snapshot.Control.Runs),
-		RecoveredRoutes:  len(leasing),
-		RecoveredPermits: len(permitEvents),
-		JournalEvents:    len(events),
-		Ready:            true,
+		RecoveredRuns:               len(snapshot.Control.Runs),
+		RecoveredRoutes:             len(leasing),
+		RecoveredPermits:            len(permitEvents),
+		RecoveredMaintenancePermits: len(snapshot.Control.MaintenancePermits),
+		JournalEvents:               len(events),
+		Ready:                       true,
 	}, nil
 }
 
@@ -655,6 +684,16 @@ func (r *Runtime) InterlockStatus() []model.Interlock {
 			reason = fmt.Sprintf("locked for %s at epoch %d", closure.RunID, closure.CommandEpoch)
 		}
 		interlocks = append(interlocks, model.Interlock{Name: "closure/" + closure.StationID, Ready: closure.Locked, Reason: reason})
+	}
+	for _, permit := range r.Maintenance.Active() {
+		view := model.ViewOf(permit)
+		for _, blocked := range view.BlockedOperations {
+			interlocks = append(interlocks, model.Interlock{
+				Name:   fmt.Sprintf("maintenance/%s/%s", permit.ID, blocked.Operation),
+				Ready:  false,
+				Reason: blocked.Reason,
+			})
+		}
 	}
 	sort.Slice(interlocks, func(i, j int) bool { return interlocks[i].Name < interlocks[j].Name })
 	return interlocks
@@ -706,19 +745,20 @@ func (r *Runtime) HealthDetails() map[string]any {
 	ready := validationError == nil && run.Health(r.Runs) && tracker.Ready(r.Tracker) && launcher.Ready(r.Launcher)
 	recoverySteps := NewRecoveryPlan().Steps()
 	return map[string]any{
-		"status":              map[bool]string{true: "ok", false: "degraded"}[ready],
-		"ready":               ready,
-		"revision":            snapshot.Revision,
-		"active_runs":         len(run.Active(r.Runs)),
-		"journal_events":      len(r.Journal.Events()),
-		"persistent_sequence": sequence,
-		"persistent_checksum": checksum,
-		"validation_error":    errorText(validationError),
-		"route_leases":        len(route.Snapshot(r.Routes)),
-		"emergency_safe":      emergency.Safe(r.Pressure),
-		"pressure_samples":    len(r.Pressure.History()),
-		"recovery_steps":      recoverySteps,
-		"captured_at":         snapshot.CapturedAt,
+		"status":                     map[bool]string{true: "ok", false: "degraded"}[ready],
+		"ready":                      ready,
+		"revision":                   snapshot.Revision,
+		"active_runs":                len(run.Active(r.Runs)),
+		"journal_events":             len(r.Journal.Events()),
+		"persistent_sequence":        sequence,
+		"persistent_checksum":        checksum,
+		"validation_error":           errorText(validationError),
+		"route_leases":               len(route.Snapshot(r.Routes)),
+		"active_maintenance_permits": len(r.Maintenance.Active()),
+		"emergency_safe":             emergency.Safe(r.Pressure),
+		"pressure_samples":           len(r.Pressure.History()),
+		"recovery_steps":             recoverySteps,
+		"captured_at":                snapshot.CapturedAt,
 	}
 }
 

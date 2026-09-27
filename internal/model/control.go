@@ -99,26 +99,28 @@ type PermitState struct {
 }
 
 type OperationRecord struct {
-	Run       Run             `json:"run"`
-	Route     RouteState      `json:"route"`
-	Pressure  PressureState   `json:"pressure"`
-	Tracking  []TrackingState `json:"tracking"`
-	Permits   []PermitState   `json:"permits"`
-	LastError string          `json:"last_error,omitempty"`
+	Run                Run                     `json:"run"`
+	Route              RouteState              `json:"route"`
+	Pressure           PressureState           `json:"pressure"`
+	Tracking           []TrackingState         `json:"tracking"`
+	Permits            []PermitState           `json:"permits"`
+	MaintenancePermits []MaintenancePermitView `json:"maintenance_permits"`
+	LastError          string                  `json:"last_error,omitempty"`
 }
 
 type ControlSnapshot struct {
-	Revision   string          `json:"revision"`
-	CapturedAt time.Time       `json:"captured_at"`
-	Stations   []Station       `json:"stations"`
-	Valves     []ValveState    `json:"valves"`
-	Closures   []ClosureState  `json:"closures"`
-	Pressures  []PressureState `json:"pressures"`
-	Routes     []RouteState    `json:"routes"`
-	Tracking   []TrackingState `json:"tracking"`
-	Permits    []PermitState   `json:"permits"`
-	Runs       []Run           `json:"runs"`
-	Incidents  []Incident      `json:"incidents"`
+	Revision           string              `json:"revision"`
+	CapturedAt         time.Time           `json:"captured_at"`
+	Stations           []Station           `json:"stations"`
+	Valves             []ValveState        `json:"valves"`
+	Closures           []ClosureState      `json:"closures"`
+	Pressures          []PressureState     `json:"pressures"`
+	Routes             []RouteState        `json:"routes"`
+	Tracking           []TrackingState     `json:"tracking"`
+	Permits            []PermitState       `json:"permits"`
+	MaintenancePermits []MaintenancePermit `json:"maintenance_permits"`
+	Runs               []Run               `json:"runs"`
+	Incidents          []Incident          `json:"incidents"`
 }
 
 func (s Station) Validate() error {
@@ -268,6 +270,15 @@ func (s ControlSnapshot) Validate() error {
 			return fmt.Errorf("permit %s: %w", permit.Name, err)
 		}
 	}
+	routeIDs := make(map[string]bool, len(s.Routes))
+	for _, routeState := range s.Routes {
+		routeIDs[routeState.ID] = true
+	}
+	for _, maintenancePermit := range s.MaintenancePermits {
+		if err := maintenancePermit.Validate(stations, routeIDs); err != nil {
+			return fmt.Errorf("maintenance permit %s: %w", maintenancePermit.ID, err)
+		}
+	}
 	return nil
 }
 
@@ -315,6 +326,11 @@ func (s ControlSnapshot) Operation(runID string) (OperationRecord, bool) {
 	for _, permit := range s.Permits {
 		if permit.RunID == runID {
 			result.Permits = append(result.Permits, permit)
+		}
+	}
+	for _, maintenancePermit := range s.MaintenancePermits {
+		if maintenancePermit.RunID == runID {
+			result.MaintenancePermits = append(result.MaintenancePermits, ViewOf(maintenancePermit))
 		}
 	}
 	return result, true
